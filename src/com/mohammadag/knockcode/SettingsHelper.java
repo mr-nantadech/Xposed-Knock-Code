@@ -1,8 +1,9 @@
 package com.mohammadag.knockcode;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
 
 import android.annotation.SuppressLint;
@@ -10,211 +11,228 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.SharedPreferences.Editor;
-import android.provider.Settings.Secure;
+import android.content.SharedPreferences;
 import de.robv.android.xposed.XSharedPreferences;
 
+/**
+ * Central settings store for the module.
+ *
+ * Two contexts exist:
+ *  1. Module app (MainActivity / ChangeKnockCodeActivity) — has a real Context,
+ *     writes via Context.getSharedPreferences().
+ *  2. Xposed / hooked process — no writable Context, reads via XSharedPreferences.
+ *
+ * We use a single plain (unencrypted) world-readable file so that the same data
+ * is accessible in both contexts.  SecurePreferences is intentionally avoided:
+ * Android 8+ scopes ANDROID_ID per-app-per-cert, so the encryption key derived
+ * from ANDROID_ID would differ between the module app and every hooked process.
+ */
 public class SettingsHelper {
-	public static final String PACKAGE_NAME = "com.mohammadag.knockcode";
-	private static final String PREFS_NAME = PACKAGE_NAME + "_preferences";
-	public static final String INTENT_SETTINGS_CHANGED = PACKAGE_NAME + ".SETTINGS_CHANGED";
 
-	private XSharedPreferences mXPreferencesImpl = null;
-	private SecurePreferences mXPreferences = null;
-	private static SecurePreferences mPreferences = null;
-	private Context mContext;
+    public static final String PACKAGE_NAME  = "com.mohammadag.knockcode";
+    /** Shared-prefs file name — plain, world-readable (LSPosed allows this). */
+    public static final String PREFS_NAME    = PACKAGE_NAME + "_settings";
+    public static final String INTENT_SETTINGS_CHANGED = PACKAGE_NAME + ".SETTINGS_CHANGED";
 
-	private HashSet<OnSettingsReloadedListener> mReloadListeners = null;
-	private String mUuid;
+    // Keys
+    private static final String KEY_PASSCODE      = "passcode";
+    private static final String KEY_DRAW_LINES    = "should_draw_lines";
+    private static final String KEY_DRAW_FILL     = "should_draw_fill";
+    // CSV string — more reliable than StringSet across XSharedPreferences
+    private static final String KEY_LOCKED_APPS   = "locked_apps_csv";
 
-	public interface OnSettingsReloadedListener {
-		void onSettingsReloaded();
-	}
+    // ── In-app (writable) ─────────────────────────────────────────────────────
+    private SharedPreferences mPrefs;   // set when constructed with Context
+    private Context mContext;
 
-	public SettingsHelper(String uuid) {
-		mUuid = uuid;
-		mXPreferencesImpl = new XSharedPreferences(PACKAGE_NAME);
-		mXPreferencesImpl.makeWorldReadable();
-		mXPreferences = new SecurePreferences(mXPreferencesImpl, uuid);
+    // ── Xposed (read-only) ────────────────────────────────────────────────────
+    private XSharedPreferences mXPrefs; // set when constructed with uuid (Xposed path)
 
-		reloadSettings();
-	}
+    private Set<OnSettingsReloadedListener> mReloadListeners;
 
-	public SettingsHelper(Context context) {
-		mContext = context;
-		mPreferences = getWritablePreferences(context);
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // Constructors
+    // ─────────────────────────────────────────────────────────────────────────
 
-	public Context getContext() {
-		return mContext;
-	}
+    /** Xposed context: no writable Context available, uuid unused (kept for API compat). */
+    public SettingsHelper(String uuid) {
+        mXPrefs = new XSharedPreferences(PACKAGE_NAME, PREFS_NAME);
+        // makeWorldReadable() is deprecated / no-op in LSPosed — omitted.
+        reloadSettings();
+    }
 
-	public void reloadSettings() {
-		mXPreferencesImpl.reload();
-		mXPreferences = new SecurePreferences(mXPreferencesImpl, mUuid);
-		try {
-			if (mReloadListeners != null) {
-				for (OnSettingsReloadedListener listener : mReloadListeners)
-					listener.onSettingsReloaded();
-			}
-		} catch (Throwable t) {}
-	}
+    /** Module app context. */
+    public SettingsHelper(Context context) {
+        mContext = context;
+        mPrefs   = getWritablePreferences(context);
+    }
 
-	public void addInProcessListener(Context context) {
-		context.registerReceiver(new BroadcastReceiver() {	
-			@Override
-			public void onReceive(Context context, Intent intent) {
-				reloadSettings();
-			}
-		}, new IntentFilter(INTENT_SETTINGS_CHANGED));
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ─────────────────────────────────────────────────────────────────────────
 
-	public static void emitSettingsChanged(Context context) {
-		context.sendBroadcast(new Intent(INTENT_SETTINGS_CHANGED));
-	}
+    public void reloadSettings() {
+        if (mXPrefs != null) mXPrefs.reload();
+        notifyListeners();
+    }
 
-	public void addOnReloadListener(OnSettingsReloadedListener listener) {
-		if (mReloadListeners == null)
-			mReloadListeners = new HashSet<SettingsHelper.OnSettingsReloadedListener>();
+    public void addInProcessListener(Context context) {
+        context.registerReceiver(new BroadcastReceiver() {
+            @Override public void onReceive(Context ctx, Intent intent) { reloadSettings(); }
+        }, new IntentFilter(INTENT_SETTINGS_CHANGED));
+    }
 
-		mReloadListeners.add(listener);
-	}
+    public static void emitSettingsChanged(Context context) {
+        context.sendBroadcast(new Intent(INTENT_SETTINGS_CHANGED));
+    }
 
-	public Editor edit() {
-		return mPreferences.edit();
-	}
+    public void addOnReloadListener(OnSettingsReloadedListener l) {
+        if (mReloadListeners == null) mReloadListeners = new HashSet<>();
+        mReloadListeners.add(l);
+    }
 
-	@SuppressLint("WorldReadableFiles")
-	@SuppressWarnings("deprecation")
-	public static SecurePreferences getWritablePreferences(Context context) {
-		String uuid = Secure.getString(context.getContentResolver(),
-				Secure.ANDROID_ID);
-		if (mPreferences == null)
-			mPreferences = new SecurePreferences(context.getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE), uuid);
+    private void notifyListeners() {
+        if (mReloadListeners == null) return;
+        try {
+            for (OnSettingsReloadedListener l : mReloadListeners) l.onSettingsReloaded();
+        } catch (Throwable ignored) {}
+    }
 
-		return mPreferences;
-	}
+    public interface OnSettingsReloadedListener {
+        void onSettingsReloaded();
+    }
 
-	public String getString(String key, String defaultValue) {
-		String returnResult = defaultValue;
-		if (mPreferences != null) {
-			returnResult = mPreferences.getString(key, defaultValue);
-		} else if (mXPreferences != null) {
-			returnResult = mXPreferences.getString(key, defaultValue);
-		}
-		return returnResult;
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // Static helper — returns writable prefs for use in the module app
+    // ─────────────────────────────────────────────────────────────────────────
 
-	public Map<String, ?> getAll() {
-		if (mPreferences != null) {
-			return mPreferences.getAll();
-		} else if (mXPreferences != null) {
-			return mXPreferences.getAll();
-		}
+    @SuppressLint("WorldReadableFiles")
+    @SuppressWarnings("deprecation")
+    public static SharedPreferences getWritablePreferences(Context context) {
+        // MODE_WORLD_READABLE: LSPosed suppresses the SecurityException for modules
+        // that declare xposedsharedprefs=true, so XSharedPreferences can read this file.
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE);
+    }
 
-		return null;
-	}
+    public SharedPreferences.Editor edit() {
+        if (mPrefs == null) mPrefs = getWritablePreferences(mContext);
+        return mPrefs.edit();
+    }
 
-	public float getFloat(String key, float defaultValue) {
-		float returnResult = defaultValue;
-		if (mPreferences != null) {
-			returnResult = mPreferences.getFloat(key, defaultValue);
-		} else if (mXPreferences != null) {
-			returnResult = mXPreferences.getFloat(key, defaultValue);
-		}
-		return returnResult;
-	}
+    public Context getContext() { return mContext; }
 
-	public int getInt(String key, int defaultValue) {
-		int returnResult = defaultValue;
-		if (mPreferences != null) {
-			returnResult = mPreferences.getInt(key, defaultValue);
-		} else if (mXPreferences != null) {
-			returnResult = mXPreferences.getInt(key, defaultValue);
-		}
-		return returnResult;
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // Generic getters (app context OR Xposed context)
+    // ─────────────────────────────────────────────────────────────────────────
 
-	public boolean getBoolean(String key, boolean defaultValue) {
-		boolean returnResult = defaultValue;
-		if (mPreferences != null) {
-			returnResult = mPreferences.getBoolean(key, defaultValue);
-		} else if (mXPreferences != null) {
-			returnResult = mXPreferences.getBoolean(key, defaultValue);
-		}
-		return returnResult;
-	}
+    private String getString(String key, String def) {
+        if (mPrefs  != null) return mPrefs.getString(key, def);
+        if (mXPrefs != null) return mXPrefs.getString(key, def);
+        return def;
+    }
 
-	public Set<String> getStringSet(String key, Set<String> defaultValue) {
-		Set<String> returnResult = defaultValue;
-		if (mPreferences != null) {
-			returnResult = mPreferences.getStringSet(key, defaultValue);
-		} else if (mXPreferences != null) {
-			returnResult = mXPreferences.getStringSet(key, defaultValue);
-		}
-		return returnResult;
-	}
+    private boolean getBoolean(String key, boolean def) {
+        if (mPrefs  != null) return mPrefs.getBoolean(key, def);
+        if (mXPrefs != null) return mXPrefs.getBoolean(key, def);
+        return def;
+    }
 
-	public boolean contains(String key) {
-		if (mPreferences != null)
-			return mPreferences.contains(key);
-		else if (mXPreferences != null)
-			return mXPreferences.contains(key);
+    @SuppressWarnings("unchecked")
+    private Set<String> getStringSet(String key, Set<String> def) {
+        if (mPrefs  != null) return mPrefs.getStringSet(key, def);
+        if (mXPrefs != null) return mXPrefs.getStringSet(key, def);
+        return def;
+    }
 
-		return false;
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // Passcode
+    // ─────────────────────────────────────────────────────────────────────────
 
-	public void setPasscode(ArrayList<Integer> passcode) {
-		String string = "";
-		for (int i = 0; i < passcode.size(); i++) {
-			string += String.valueOf(passcode.get(i));
-			if (i != passcode.size()-1) {
-				string += ",";
-			}
-		}
+    public void setPasscode(ArrayList<Integer> passcode) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < passcode.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(passcode.get(i));
+        }
+        edit().putString(KEY_PASSCODE, sb.toString()).commit();
+        emitSettingsChanged(mContext);
+    }
 
-		edit().putString("passcode", string).commit();
-		emitSettingsChanged(mContext);
-	}
+    public ArrayList<Integer> getPasscode() {
+        return parsePasscode(getString(KEY_PASSCODE, "1,2,3,4"));
+    }
 
-	public ArrayList<Integer> getPasscodeOrNull() {
-		ArrayList<Integer> passcode = new ArrayList<Integer>();
-		String string = getString("passcode", null);
-		if (string == null)
-			return null;
+    public ArrayList<Integer> getPasscodeOrNull() {
+        String s = getString(KEY_PASSCODE, null);
+        return s != null ? parsePasscode(s) : null;
+    }
 
-		String[] integers = string.split(",");
-		for (String digitString : integers) {
-			passcode.add(Integer.parseInt(digitString));
-		}
-		return passcode;
-	}
+    private static ArrayList<Integer> parsePasscode(String s) {
+        ArrayList<Integer> list = new ArrayList<>();
+        for (String part : s.split(",")) {
+            try { list.add(Integer.parseInt(part.trim())); }
+            catch (NumberFormatException ignored) {}
+        }
+        return list;
+    }
 
-	public ArrayList<Integer> getPasscode() {
-		ArrayList<Integer> passcode = new ArrayList<Integer>();
-		String string = getString("passcode", "1,2,3,4");
-		String[] integers = string.split(",");
-		for (String digitString : integers) {
-			passcode.add(Integer.parseInt(digitString));
-		}
-		return passcode;
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // Appearance
+    // ─────────────────────────────────────────────────────────────────────────
 
-	public boolean shouldDrawLines() {
-		return getBoolean("should_draw_lines", true);
-	}
+    public boolean shouldDrawLines() { return getBoolean(KEY_DRAW_LINES, true); }
 
-	public void setShouldDrawLines(boolean draw) {
-		edit().putBoolean("should_draw_lines", draw).commit();
-		emitSettingsChanged(mContext);
-	}
+    public void setShouldDrawLines(boolean v) {
+        edit().putBoolean(KEY_DRAW_LINES, v).commit();
+        emitSettingsChanged(mContext);
+    }
 
-	public boolean shouldDrawFill() {
-		return getBoolean("should_draw_fill", true);
-	}
+    public boolean shouldDrawFill() { return getBoolean(KEY_DRAW_FILL, true); }
 
-	public void setShouldDrawFill(boolean draw) {
-		edit().putBoolean("should_draw_fill", draw).commit();
-		emitSettingsChanged(mContext);
-	}
+    public void setShouldDrawFill(boolean v) {
+        edit().putBoolean(KEY_DRAW_FILL, v).commit();
+        emitSettingsChanged(mContext);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Locked apps
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Save the set of locked package names (module app context). */
+    @SuppressLint("WorldReadableFiles")
+    @SuppressWarnings("deprecation")
+    public static void saveLockedApps(Context context, Set<String> packages) {
+        StringBuilder sb = new StringBuilder();
+        for (String pkg : packages) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(pkg);
+        }
+        getWritablePreferences(context).edit()
+                .putString(KEY_LOCKED_APPS, sb.toString())
+                .commit();
+        emitSettingsChanged(context);
+    }
+
+    /** Read locked apps — Xposed context (no writable Context available). */
+    public static Set<String> readLockedApps() {
+        XSharedPreferences prefs = new XSharedPreferences(PACKAGE_NAME, PREFS_NAME);
+        prefs.reload();
+        return parseCsvSet(prefs.getString(KEY_LOCKED_APPS, ""));
+    }
+
+    /** Read locked apps — module app context. */
+    public static Set<String> readLockedApps(Context context) {
+        return parseCsvSet(
+                getWritablePreferences(context).getString(KEY_LOCKED_APPS, ""));
+    }
+
+    private static Set<String> parseCsvSet(String csv) {
+        Set<String> result = new HashSet<>();
+        if (csv == null || csv.trim().isEmpty()) return result;
+        for (String part : csv.split(",")) {
+            String pkg = part.trim();
+            if (!pkg.isEmpty()) result.add(pkg);
+        }
+        return result;
+    }
 }

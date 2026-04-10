@@ -1,41 +1,52 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.mohammadag.knockcode"
-    android:versionCode="5"
-    android:versionName="1.0.4" >
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-sdk
-        android:minSdkVersion="17"
-        android:targetSdkVersion="19" />
+    <!-- Declare intent visibility so queryIntentActivities returns launcher apps
+         on Android 11+ without needing QUERY_ALL_PACKAGES -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="true"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/AppTheme" >
+
         <activity
-            android:name="com.mohammadag.knockcode.MainActivity"
+            android:name=".MainActivity"
+            android:exported="true"
             android:label="@string/app_name" >
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
         <activity
-            android:name="com.mohammadag.knockcode.ChangeKnockCodeActivity"
-            android:label="@string/app_name" >
-        </activity>
+            android:name=".ChangeKnockCodeActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+        <activity
+            android:name=".LockedAppsActivity"
+            android:exported="false"
+            android:label="@string/pref_title_locked_apps" />
 
+        <!-- Xposed / LSPosed module metadata -->
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
             android:name="xposedminversion"
-            android:value="40+" />
+            android:value="93" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Knock code for all 4.2+ devices" />
+            android:value="Knock code lockscreen for Android 12+ (LSPosed)" />
+        <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
     </application>
 
 </manifest>

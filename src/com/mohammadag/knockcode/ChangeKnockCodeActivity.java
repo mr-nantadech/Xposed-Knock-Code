@@ -78,12 +78,11 @@ public class ChangeKnockCodeActivity extends Activity implements OnPositionTappe
 
 	@Override
 	public void onClick(View v) {
-		switch (v.getId()) {
-		case R.id.retry_button:
+		int id = v.getId();
+		if (id == R.id.retry_button) {
 			mKnockCodeView.setMode(Mode.READY);
 			reset();
-			break;
-		case R.id.next_button:
+		} else if (id == R.id.next_button) {
 			if (mIsOldCode) {
 				if (confirmPasscodePair(mFirstTappedPositions, mSettingsHelper.getPasscode())) {
 					mIsOldCode = false;
@@ -107,7 +106,6 @@ public class ChangeKnockCodeActivity extends Activity implements OnPositionTappe
 					knocksDoNotMatch();
 				}
 			}
-			break;
 		}
 	}
 

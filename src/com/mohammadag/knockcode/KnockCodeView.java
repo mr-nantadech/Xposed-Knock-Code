@@ -128,8 +128,11 @@ public class KnockCodeView extends View implements OnSettingsReloadedListener {
 		}
 
 		if (shouldDrawLines()) {
-			canvas.drawLine(getWidth() / 2, 0, getWidth() / 2, getHeight(), mLinePaint);
-			canvas.drawLine(0, getHeight() / 2, getWidth(), getHeight() / 2, mLinePaint);
+			// vertical divider
+			canvas.drawLine(getWidth() / 2f, 0, getWidth() / 2f, getHeight(), mLinePaint);
+			// two horizontal dividers — 3 rows
+			canvas.drawLine(0, getHeight() / 3f, getWidth(), getHeight() / 3f, mLinePaint);
+			canvas.drawLine(0, getHeight() * 2f / 3f, getWidth(), getHeight() * 2f / 3f, mLinePaint);
 		}
 
 		if (mPosition != -1 && shouldDrawFill()) {
@@ -183,20 +186,12 @@ public class KnockCodeView extends View implements OnSettingsReloadedListener {
 	}
 
 	private int getPositionOfClick(float x, float y) {
-		if (y < getHeight() / 2) {
-			if (x > getWidth() / 2) {
-				return 2;
-			} else {
-				return 1;
-			}
-		} else if (y > getHeight() / 2) {
-			if (x > getWidth() / 2) {
-				return 4;
-			} else {
-				return 3;
-			}
-		}
-		return -1;
+		int col = (x >= getWidth() / 2f) ? 1 : 0;   // 0 = left, 1 = right
+		int row;
+		if      (y < getHeight() / 3f)        row = 0;   // top
+		else if (y < getHeight() * 2f / 3f)   row = 1;   // middle
+		else                                   row = 2;   // bottom
+		return row * 2 + col + 1;   // 1-indexed: 1..6
 	}
 
 	private Rect getRectForPosition(int pos) {
@@ -204,17 +199,17 @@ public class KnockCodeView extends View implements OnSettingsReloadedListener {
 	}
 
 	private Rect getRectForPositionImpl(int pos) {
+		int w2 = getWidth() / 2;
+		int h3 = getHeight() / 3;
 		switch (pos) {
-		case 1:
-			return new Rect(0, 0, getWidth() / 2, getHeight() / 2);
-		case 2:
-			return new Rect(getWidth() / 2, 0, getWidth(), getHeight() / 2);
-		case 3:
-			return new Rect(0, getHeight() / 2, getWidth() / 2, getHeight());
-		case 4:
-			return new Rect(getWidth() / 2, getHeight() / 2, getWidth(), getHeight());
+		case 1: return new Rect(0,  0,       w2,          h3);
+		case 2: return new Rect(w2, 0,       getWidth(),  h3);
+		case 3: return new Rect(0,  h3,      w2,          h3 * 2);
+		case 4: return new Rect(w2, h3,      getWidth(),  h3 * 2);
+		case 5: return new Rect(0,  h3 * 2,  w2,          getHeight());
+		case 6: return new Rect(w2, h3 * 2,  getWidth(),  getHeight());
 		default:
-			throw new IllegalArgumentException("Only position 1-4 supported");
+			throw new IllegalArgumentException("Only position 1-6 supported");
 		}
 	}
 

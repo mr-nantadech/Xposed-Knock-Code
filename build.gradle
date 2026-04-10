@@ -1,0 +1,56 @@
+plugins {
+    id 'com.android.application' version '8.2.2' apply true
+}
+
+android {
+    namespace 'com.mohammadag.knockcode'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.mohammadag.knockcode'
+        minSdk 26
+        targetSdk 34
+        versionCode 6
+        versionName '2.0.0'
+    }
+
+    // Point Gradle at the existing Eclipse-style source layout
+    sourceSets {
+        main {
+            java.srcDirs = ['src']
+            res.srcDirs = ['res']
+            assets.srcDirs = ['assets']
+            manifest.srcFile 'AndroidManifest.xml'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    // Suppress deprecation warnings from old PreferenceActivity usage
+    lintOptions {
+        disable 'deprecation'
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+    maven { url 'https://api.xposed.info/' }
+}
+
+dependencies {
+    // Xposed API — compileOnly so it is NOT bundled in the APK
+    compileOnly 'de.robv.android.xposed:api:82'
+}

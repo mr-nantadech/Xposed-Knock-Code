@@ -9,6 +9,10 @@
         android:key="change_knock_code"
         android:summary="@string/pref_description_change_code"
         android:title="@string/pref_title_change_code" />
+    <Preference
+        android:key="locked_apps"
+        android:summary="@string/pref_description_locked_apps"
+        android:title="@string/pref_title_locked_apps" />
 
     <PreferenceCategory android:title="@string/appearance" >
         <CheckBoxPreference

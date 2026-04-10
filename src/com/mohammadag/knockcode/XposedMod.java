@@ -1,291 +1,406 @@
 package com.mohammadag.knockcode;
 
-import static de.robv.android.xposed.XposedHelpers.callMethod;
 import static de.robv.android.xposed.XposedHelpers.findAndHookMethod;
 import static de.robv.android.xposed.XposedHelpers.getObjectField;
+
+import android.app.Activity;
 import android.content.Context;
-import android.provider.Settings.Secure;
+import android.content.Intent;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.widget.FrameLayout;
-import android.widget.ViewFlipper;
+
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
-public class XposedMod implements IXposedHookLoadPackage {
+public class XposedMod implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
-	private XC_MethodHook mUpdateSecurityViewHook;
-	private XC_MethodHook mShowSecurityScreenHook;
-	private XC_MethodHook mKeyguardHostViewInitHook;
-	private XC_MethodReplacement mOnScreenTurnedOnHook;
-	private XC_MethodReplacement mOnScreenTurnedOffHook;
-	protected KnockCodeUnlockView mKnockCodeView;
-	private static SettingsHelper mSettingsHelper;
+    /**
+     * Called by Zygote before any app process is forked.
+     * Store the module APK path so ResourceHelper can build an AssetManager from it,
+     * bypassing MIUI's createPackageContext restriction.
+     */
+    @Override
+    public void initZygote(StartupParam startupParam) throws Throwable {
+        ResourceHelper.setModulePath(startupParam.modulePath);
+        XposedBridge.log(TAG + " initZygote modulePath=" + startupParam.modulePath);
+    }
 
-	@Override
-	public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
-		if ("com.htc.lockscreen".equals(lpparam.packageName)) {
-			hookHtcLockscreen(lpparam);
-		}
+    private static final String TAG = "[KnockCode]";
 
-		if ("com.android.keyguard".equals(lpparam.packageName)) {
-			hookAospLockscreen(lpparam);
-		}
+    // ── Lockscreen state ──────────────────────────────────────────────────────
+    private static SettingsHelper sSettingsHelper;
+    private KnockCodeUnlockView mLockscreenView;
 
-		if ("android".equals(lpparam.packageName)) {
-			hookPrekitkatLockscreen(lpparam);
-		}
-	}
+    // ── App locker state ──────────────────────────────────────────────────────
+    /** Packages whose current session has been unlocked (cleared when app backgrounds). */
+    private static final Set<String> sSessionUnlocked =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-	private void createHooksIfNeeded(final String keyguardPackageName) {
-		// We don't need this since we can't cast our widget to a KeyguardSecurityView, no matter
-		// how hard we try. Although if possible, this is the cleaner way to do things: it gets rid
-		// of all the hooks below.
-		//
-		//		mGetSecurityViewHook = new XC_MethodHook() {
-		//			@Override
-		//			protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-		//				Object paramSecurityMode = param.args[0];
-		//				Class<?> SecurityMode = XposedHelpers.findClass(securityModeClasssName,
-		//						param.thisObject.getClass().getClassLoader());
-		//				Object patternMode = XposedHelpers.getStaticObjectField(SecurityMode, "Pattern");
-		//
-		//				if (patternMode.equals(paramSecurityMode)) {
-		//					Context mContext;
-		//					try {
-		//						mContext = (Context) XposedHelpers.getObjectField(param.thisObject, "mThemeContext");
-		//					} catch (NoSuchFieldError e) {
-		//						mContext = ((FrameLayout) param.thisObject).getContext();
-		//					}
-		//					KnockCodeUnlockView knockCodeView = new KnockCodeUnlockView(mContext);
-		//					ViewFlipper mSecurityViewContainer = (ViewFlipper) XposedHelpers.getObjectField(param.thisObject, "mSecurityViewContainer");
-		//					mSecurityViewContainer.addView(knockCodeView);
-		//
-		//					XposedHelpers.callMethod(param.thisObject, "updateSecurityView", knockCodeView);
-		//					param.setResult(knockCodeView);
-		//				}
-		//			}
-		//		};
+    /** Pending re-lock runnables, cancelled when a new Activity resumes in the same app. */
+    private static final Map<String, Runnable> sRelockPending = new ConcurrentHashMap<>();
 
-		mKeyguardHostViewInitHook = new XC_MethodHook() {
-			@Override
-			protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-				if (mSettingsHelper == null) {
-					Context context = (Context) param.args[0];
-					String uuid = Secure.getString(context.getContentResolver(),
-							Secure.ANDROID_ID);
-					mSettingsHelper = new SettingsHelper(uuid);
-				}
-			}
-		};
+    private static Handler sMainHandler;
 
-		mUpdateSecurityViewHook = new XC_MethodHook() {
-			@Override
-			protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-				View view = (View) param.args[0];
-				if (view instanceof KnockCodeUnlockView) {
-					KnockCodeUnlockView unlockView = (KnockCodeUnlockView) view;
-					unlockView.setKeyguardCallback(XposedHelpers.getObjectField(param.thisObject, "mCallback"));
-					unlockView.setLockPatternUtils(XposedHelpers.getObjectField(param.thisObject, "mLockPatternUtils"));
-					param.setResult(null);
-				}
-			}
-		};
+    // ─────────────────────────────────────────────────────────────────────────
+    // Entry point
+    // ─────────────────────────────────────────────────────────────────────────
 
-		mShowSecurityScreenHook = new XC_MethodHook() {
-			@Override
-			protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-				Object securityMode = param.args[0];
-				Class<?> SecurityMode = XposedHelpers.findClass(keyguardPackageName + ".KeyguardSecurityModel$SecurityMode",
-						param.thisObject.getClass().getClassLoader());
-				Object patternMode = XposedHelpers.getStaticObjectField(SecurityMode, "Pattern");
+    @Override
+    public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
+        // ── 1. Lockscreen replacement (System UI) ─────────────────────────────
+        if ("com.android.systemui".equals(lpparam.packageName)) {
+            try {
+                hookSecurityContainerController(lpparam);
+                XposedBridge.log(TAG + " lockscreen hook registered");
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + " lockscreen hook failed: " + t.getMessage());
+            }
+            try { hookMiuiPath(lpparam); } catch (Throwable ignored) {}
+            return;
+        }
 
-				if (!patternMode.equals(securityMode))
-					return;
-				Object mCurrentSecuritySelection = XposedHelpers.getObjectField(param.thisObject, "mCurrentSecuritySelection");
+        // ── 2. App locker ─────────────────────────────────────────────────────
+        if (SettingsHelper.PACKAGE_NAME.equals(lpparam.packageName)) return;
+        if ("android".equals(lpparam.packageName)) return;
 
-				if (securityMode == mCurrentSecuritySelection) return;
+        Set<String> lockedApps = SettingsHelper.readLockedApps();
+        XposedBridge.log(TAG + " pkg=" + lpparam.packageName
+                + " lockedApps=" + lockedApps.toString());
 
-				Context mContext;
-				try {
-					mContext = (Context) XposedHelpers.getObjectField(param.thisObject, "mThemeContext");
-				} catch (NoSuchFieldError e) {
-					mContext = ((FrameLayout) param.thisObject).getContext();
-				}
-				View oldView = (View) callMethod(param.thisObject, "getSecurityView", mCurrentSecuritySelection);
+        if (lockedApps.contains(lpparam.packageName)) {
+            hookAppForLocking(lpparam);
+            XposedBridge.log(TAG + " app lock hook SET: " + lpparam.packageName);
+        }
+    }
 
-				mKnockCodeView = new KnockCodeUnlockView(mContext);
-				mKnockCodeView.setSettingsHelper(mSettingsHelper);
-				View newView = mKnockCodeView;
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lockscreen — AOSP Android 12
+    // ─────────────────────────────────────────────────────────────────────────
 
-				ViewGroup mAppWidgetContainer = (ViewGroup) getObjectField(param.thisObject, "mAppWidgetContainer");
-				mAppWidgetContainer.setVisibility(View.VISIBLE);
-				FrameLayout layout = (FrameLayout) param.thisObject;
-				// Don't show camera or search in navbar when SIM or Account screen is showing
+    private void hookSecurityContainerController(LoadPackageParam lpparam) {
+        final ClassLoader cl = lpparam.classLoader;
 
-				int disableSearch = XposedHelpers.getStaticIntField(View.class, "STATUS_BAR_DISABLE_SEARCH");
-				layout.setSystemUiVisibility((layout.getSystemUiVisibility() & ~disableSearch));
+        final Class<?> SecurityMode = XposedHelpers.findClass(
+                "com.android.keyguard.KeyguardSecurityModel$SecurityMode", cl);
+        final Class<?> ContainerClass = XposedHelpers.findClass(
+                "com.android.keyguard.KeyguardSecurityContainer", cl);
+        final Class<?> ControllerClass = XposedHelpers.findClass(
+                "com.android.keyguard.KeyguardSecurityContainerController", cl);
 
-				Object mSlidingChallengeLayout = getObjectField(param.thisObject, "mSlidingChallengeLayout");
-				if (mSlidingChallengeLayout != null) {
-					callMethod(mSlidingChallengeLayout, "setChallengeInteractive", true);
-				}
+        // Grab Context early from the container constructor
+        XposedBridge.hookAllConstructors(ContainerClass, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                if (sSettingsHelper != null) return;
+                Context ctx = ((FrameLayout) param.thisObject).getContext();
+                initSettingsHelper(ctx);
+            }
+        });
 
-				// Emulate Activity life cycle
-				if (oldView != null) {
-					Object mNullCallback = getObjectField(param.thisObject, "mNullCallback");
-					callMethod(oldView, "onPause");
-					callMethod(oldView, "setKeyguardCallback", mNullCallback); // ignore requests from old view
-				}
-				Object mCallback = getObjectField(param.thisObject, "mCallback");
-				callMethod(newView, "onResume", KeyguardSecurityView.VIEW_REVEALED);
-				callMethod(newView, "setKeyguardCallback", mCallback);
+        findAndHookMethod(ControllerClass, "showSecurityScreen", SecurityMode,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        handleShowSecurityScreen(param, SecurityMode);
+                    }
+                });
 
-				final boolean needsInput = (Boolean) callMethod(newView, "needsInput");
-				Object mViewMediatorCallback = getObjectField(param.thisObject, "mViewMediatorCallback");
-				if (mViewMediatorCallback != null) {
-					callMethod(mViewMediatorCallback, "setNeedsInput", needsInput);
-				}
+        try {
+            findAndHookMethod(ControllerClass, "onResume", int.class, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    if (mLockscreenView != null)
+                        mLockscreenView.onResume((Integer) param.args[0]);
+                }
+            });
+        } catch (Throwable ignored) {}
 
-				// Find and show this child.
-				ViewFlipper mSecurityViewContainer = (ViewFlipper) getObjectField(param.thisObject, "mSecurityViewContainer");
-				mSecurityViewContainer.addView(newView);
-				final int childCount = mSecurityViewContainer.getChildCount();
+        try {
+            findAndHookMethod(ControllerClass, "onPause", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    if (mLockscreenView != null) mLockscreenView.onPause();
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
 
-				for (int i = 0; i < childCount; i++) {
-					if (mSecurityViewContainer.getChildAt(i) instanceof KnockCodeUnlockView) {
-						mSecurityViewContainer.setDisplayedChild(i);
-						mSecurityViewContainer.getChildAt(i).requestFocus();
-						break;
-					}
-				}
+    private void handleShowSecurityScreen(
+            XC_MethodHook.MethodHookParam param, Class<?> SecurityMode) throws Throwable {
+        Object requestedMode = param.args[0];
+        Object patternMode   = XposedHelpers.getStaticObjectField(SecurityMode, "Pattern");
+        if (!patternMode.equals(requestedMode)) return;
 
-				XposedHelpers.setObjectField(param.thisObject,
-						"mCurrentSecuritySelection", securityMode);
+        FrameLayout container = resolveContainer(param.thisObject);
+        if (container == null) return;
 
-				try {
-					callMethod(param.thisObject, "notifyScreenChanged");
-					callMethod(param.thisObject, "updateFooterPanelVisibility");
-				} catch (Throwable t) {
-					// Not an HTC
-				}
-				param.setResult(null);
-			}
-		};
+        Context ctx = container.getContext();
+        if (sSettingsHelper == null) initSettingsHelper(ctx);
 
-		mOnScreenTurnedOnHook = new XC_MethodReplacement() {
-			@Override
-			protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
-				callMethod(param.thisObject, "showPrimarySecurityScreen", false);
-				Object mCurrentSecuritySelection = getObjectField(param.thisObject, "mCurrentSecuritySelection");
-				Object view = callMethod(param.thisObject, "getSecurityView", mCurrentSecuritySelection);
-				if (view != null) {
-					callMethod(view, "onResume", 1);
-				}
+        // Reuse or create the lockscreen view
+        if (mLockscreenView == null || mLockscreenView.getParent() != container) {
+            if (mLockscreenView != null && mLockscreenView.getParent() instanceof ViewGroup)
+                ((ViewGroup) mLockscreenView.getParent()).removeView(mLockscreenView);
 
-				if (mKnockCodeView != null) {
-					mKnockCodeView.onResume(1);
-				}
+            mLockscreenView = new KnockCodeUnlockView(ctx);
+            if (sSettingsHelper != null) mLockscreenView.setSettingsHelper(sSettingsHelper);
+            container.addView(mLockscreenView, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT));
+        }
 
-				// This is a an attempt to fix bug 7137389 where the device comes back on but the entire
-				// layout is blank but forcing a layout causes it to reappear (e.g. with with
-				// hierarchyviewer).
-				FrameLayout layout = (FrameLayout) param.thisObject;
-				layout.requestLayout();
+        Object callback = resolveCallback(param.thisObject);
+        if (callback != null) mLockscreenView.setKeyguardCallback(callback);
 
-				try {
-					Object mViewStateManager = getObjectField(param.thisObject, "mViewStateManager");
-					if (mViewStateManager != null) {
-						callMethod("mViewStateManager", "showUsabilityHints");
-					}
-				} catch (Throwable t) {
+        try {
+            mLockscreenView.setLockPatternUtils(getObjectField(param.thisObject, "mLockPatternUtils"));
+        } catch (Throwable ignored) {}
 
-				}
+        mLockscreenView.setVisibility(View.VISIBLE);
+        mLockscreenView.bringToFront();
+        mLockscreenView.onResume(KeyguardSecurityView.VIEW_REVEALED);
 
-				layout.requestFocus();
-				return null;
-			}
-		};
+        try { XposedHelpers.setObjectField(param.thisObject, "mCurrentSecurityMode", requestedMode); }
+        catch (Throwable ignored) {}
+        try { XposedHelpers.setObjectField(param.thisObject, "mCurrentSecuritySelection", requestedMode); }
+        catch (Throwable ignored) {}
 
-		mOnScreenTurnedOffHook = new XC_MethodReplacement() {
-			@Override
-			protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
-				FrameLayout layout = (FrameLayout) param.thisObject;
-				Context mContext = (Context) getObjectField(param.thisObject, "mContext");
-				// Once the screen turns off, we no longer consider this to be first boot and we want the
-				// biometric unlock to start next time keyguard is shown.
-				Class<?> KeyguardUpdateMonitor = XposedHelpers.findClass(keyguardPackageName + ".KeyguardUpdateMonitor",
-						param.thisObject.getClass().getClassLoader());
-				Object KeyguardUpdateMonitorInstance = XposedHelpers.callStaticMethod(KeyguardUpdateMonitor, "getInstance", mContext);
-				callMethod(KeyguardUpdateMonitorInstance, "setAlternateUnlockEnabled", true);
-				// We use mAppWidgetToShow to show a particular widget after you add it-- once the screen
-				// turns off we reset that behavior
-				callMethod(param.thisObject, "clearAppWidgetToShow");
-				if ((Boolean) callMethod(KeyguardUpdateMonitorInstance, "hasBootCompleted")) {
-					callMethod(param.thisObject, "checkAppWidgetConsistency");
-				}
-				callMethod(param.thisObject, "showPrimarySecurityScreen", true);
-				Object mCurrentSecuritySelection = getObjectField(param.thisObject, "mCurrentSecuritySelection");
-				Object view = callMethod(param.thisObject, "getSecurityView", mCurrentSecuritySelection);
-				if (view != null) {
-					callMethod(view, "onPause");
-				}
+        param.setResult(null);
+    }
 
-				if (mKnockCodeView != null) {
-					mKnockCodeView.onPause();
-				}
-				try {
-					Object cameraPage = callMethod(param.thisObject, "findCameraPage");
-					if (cameraPage != null) {
-						callMethod(cameraPage, "onScreenTurnedOff");
-					}
-				} catch (Throwable t) {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lockscreen — MIUI 14 fallback
+    // ─────────────────────────────────────────────────────────────────────────
 
-				}
+    private void hookMiuiPath(LoadPackageParam lpparam) {
+        final ClassLoader cl = lpparam.classLoader;
+        String[] candidates = {
+                "com.miui.keyguard.MiuiKeyguardSecurityContainerController",
+                "com.miui.keyguard.MiuiKeyguardHostView",
+                "miui.keyguard.MiuiKeyguardHostView",
+        };
+        for (String className : candidates) {
+            try {
+                Class<?> cls = XposedHelpers.findClass(className, cl);
+                final Class<?> sm = findSecurityModeClass(cl);
+                if (sm == null) break;
+                findAndHookMethod(cls, "showSecurityScreen", sm, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        handleShowSecurityScreen(param, sm);
+                    }
+                });
+                XposedBridge.log(TAG + " MIUI hooked: " + className);
+                break;
+            } catch (Throwable ignored) {}
+        }
+    }
 
-				layout.clearFocus();
-				return null;
-			}
-		};
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    // App locker hooks
+    // ─────────────────────────────────────────────────────────────────────────
 
-	private void hookHtcLockscreen(LoadPackageParam lpparam) {
-		createHooksIfNeeded("com.htc.lockscreen.keyguard");
-		Class<?> KeyguardHostView = XposedHelpers.findClass("com.htc.lockscreen.keyguard.KeyguardHostView",
-				lpparam.classLoader);
-		XposedBridge.hookAllConstructors(KeyguardHostView, mKeyguardHostViewInitHook);
-		findAndHookMethod(KeyguardHostView, "showSecurityScreen", "com.htc.lockscreen.keyguard.KeyguardSecurityModel$SecurityMode", mShowSecurityScreenHook);
-		findAndHookMethod(KeyguardHostView, "updateSecurityView", View.class, mUpdateSecurityViewHook);
-		findAndHookMethod(KeyguardHostView, "onScreenTurnedOn", mOnScreenTurnedOnHook);
-		findAndHookMethod(KeyguardHostView, "onScreenTurnedOff", mOnScreenTurnedOffHook);
-	}
+    private void hookAppForLocking(final LoadPackageParam lpparam) {
+        final String pkg = lpparam.packageName;
 
-	private void hookAospLockscreen(LoadPackageParam lpparam) {
-		createHooksIfNeeded("com.android.keyguard");
-		Class<?> KeyguardHostView = XposedHelpers.findClass("com.android.keyguard.KeyguardHostView",
-				lpparam.classLoader);
-		XposedBridge.hookAllConstructors(KeyguardHostView, mKeyguardHostViewInitHook);
-		findAndHookMethod(KeyguardHostView, "showSecurityScreen", "com.android.keyguard.KeyguardSecurityModel$SecurityMode", mShowSecurityScreenHook);
-		findAndHookMethod(KeyguardHostView, "updateSecurityView", View.class, mUpdateSecurityViewHook);
-		findAndHookMethod(KeyguardHostView, "onScreenTurnedOn", mOnScreenTurnedOnHook);
-		findAndHookMethod(KeyguardHostView, "onScreenTurnedOff", mOnScreenTurnedOffHook);
-	}
+        // Initialise SettingsHelper as early as possible in the target process
+        findAndHookMethod("android.app.Application", lpparam.classLoader,
+                "onCreate", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        if (sSettingsHelper == null)
+                            initSettingsHelper((Context) param.thisObject);
+                    }
+                });
 
-	private void hookPrekitkatLockscreen(LoadPackageParam lpparam) {
-		if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.KITKAT)
-			return;
+        // onResume — show lock overlay if the session is not unlocked
+        findAndHookMethod("android.app.Activity", lpparam.classLoader,
+                "onResume", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        ensureMainHandler();
+                        Runnable pending = sRelockPending.remove(pkg);
+                        if (pending != null) sMainHandler.removeCallbacks(pending);
 
-		createHooksIfNeeded("com.android.internal.policy.impl.keyguard");
-		Class<?> KeyguardHostView = XposedHelpers.findClass("com.android.internal.policy.impl.keyguard.KeyguardHostView",
-				lpparam.classLoader);
-		XposedBridge.hookAllConstructors(KeyguardHostView, mKeyguardHostViewInitHook);
-		findAndHookMethod(KeyguardHostView, "showSecurityScreen", "com.android.internal.policy.impl.keyguard.KeyguardSecurityModel$SecurityMode", mShowSecurityScreenHook);
-		findAndHookMethod(KeyguardHostView, "updateSecurityView", View.class, mUpdateSecurityViewHook);
-		findAndHookMethod(KeyguardHostView, "onScreenTurnedOn", mOnScreenTurnedOnHook);
-		findAndHookMethod(KeyguardHostView, "onScreenTurnedOff", mOnScreenTurnedOffHook);
-	}
+                        Activity activity = (Activity) param.thisObject;
+                        XposedBridge.log(TAG + " onResume: " + activity.getClass().getName()
+                                + " unlocked=" + sSessionUnlocked.contains(pkg));
+
+                        if (sSessionUnlocked.contains(pkg)) return;
+
+                        showAppLockOverlay(activity, pkg);
+                    }
+                });
+
+        // onPause — schedule re-lock; cancelled if another Activity in the same
+        //           app resumes quickly (navigation within the app)
+        findAndHookMethod("android.app.Activity", lpparam.classLoader,
+                "onPause", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        if (!sSessionUnlocked.contains(pkg)) return;
+                        ensureMainHandler();
+                        Runnable task = new Runnable() {
+                            @Override public void run() {
+                                sSessionUnlocked.remove(pkg);
+                                sRelockPending.remove(pkg);
+                            }
+                        };
+                        sRelockPending.put(pkg, task);
+                        // 800 ms window — enough to cover Activity transitions
+                        sMainHandler.postDelayed(task, 800);
+                    }
+                });
+
+        // Back button — go home while the lock overlay is visible
+        findAndHookMethod("android.app.Activity", lpparam.classLoader,
+                "onBackPressed", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        if (sSessionUnlocked.contains(pkg)) return;
+                        Activity a = (Activity) param.thisObject;
+                        // Only intercept if our overlay is actually showing
+                        if (!hasAppLockView(a)) return;
+                        Intent home = new Intent(Intent.ACTION_MAIN);
+                        home.addCategory(Intent.CATEGORY_HOME);
+                        home.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        a.startActivity(home);
+                        param.setResult(null);
+                    }
+                });
+    }
+
+    private void showAppLockOverlay(final Activity activity, final String pkg) {
+        ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
+
+        // Don't stack overlays
+        if (hasAppLockView(activity)) return;
+
+        AppLockView lockView = new AppLockView(activity);
+        if (sSettingsHelper != null) lockView.setSettingsHelper(sSettingsHelper);
+
+        XposedBridge.log(TAG + " showAppLockOverlay: adding overlay for " + pkg);
+
+        lockView.setOnUnlockListener(new AppLockView.OnUnlockListener() {
+            @Override public void onUnlocked() {
+                XposedBridge.log(TAG + " UNLOCKED: " + pkg);
+                // Cancel any pending re-lock and mark session as unlocked
+                Runnable pending = sRelockPending.remove(pkg);
+                if (pending != null && sMainHandler != null)
+                    sMainHandler.removeCallbacks(pending);
+                sSessionUnlocked.add(pkg);
+
+                // Remove overlay and restore system bars
+                ViewGroup parent = (ViewGroup) lockView.getParent();
+                if (parent != null) parent.removeView(lockView);
+                exitFullScreen(activity);
+            }
+        });
+
+        decor.addView(lockView, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        lockView.bringToFront();
+        enterFullScreen(activity);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void enterFullScreen(Activity activity) {
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                WindowInsetsController c = activity.getWindow().getInsetsController();
+                if (c != null) {
+                    c.hide(WindowInsets.Type.systemBars());
+                    c.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            } else {
+                activity.getWindow().getDecorView().setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void exitFullScreen(Activity activity) {
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                WindowInsetsController c = activity.getWindow().getInsetsController();
+                if (c != null) c.show(WindowInsets.Type.systemBars());
+            } else {
+                activity.getWindow().getDecorView()
+                        .setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean hasAppLockView(Activity activity) {
+        ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
+        for (int i = 0; i < decor.getChildCount(); i++) {
+            if (decor.getChildAt(i) instanceof AppLockView) return true;
+        }
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shared helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void initSettingsHelper(Context ctx) {
+        String uuid = Settings.Secure.getString(
+                ctx.getContentResolver(), Settings.Secure.ANDROID_ID);
+        sSettingsHelper = new SettingsHelper(uuid);
+    }
+
+    private FrameLayout resolveContainer(Object controller) {
+        for (String f : new String[]{"mView", "mKeyguardSecurityContainer", "mContainer"}) {
+            try {
+                Object obj = getObjectField(controller, f);
+                if (obj instanceof FrameLayout) return (FrameLayout) obj;
+            } catch (Throwable ignored) {}
+        }
+        if (controller instanceof FrameLayout) return (FrameLayout) controller;
+        return null;
+    }
+
+    private Object resolveCallback(Object controller) {
+        for (String f : new String[]{"mKeyguardSecurityCallback", "mCallback", "mSecurityCallback"}) {
+            try { return getObjectField(controller, f); }
+            catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    private Class<?> findSecurityModeClass(ClassLoader cl) {
+        for (String n : new String[]{
+                "com.android.keyguard.KeyguardSecurityModel$SecurityMode",
+                "com.miui.keyguard.KeyguardSecurityModel$SecurityMode"}) {
+            try { return XposedHelpers.findClass(n, cl); }
+            catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    private static void ensureMainHandler() {
+        if (sMainHandler == null)
+            sMainHandler = new Handler(Looper.getMainLooper());
+    }
 }
